@@ -1,0 +1,179 @@
+# ======================
+# Super-Easy Filmmaking System
+# ======================
+
+# Step 1: 清理环境
+!pip uninstall -y datasets fsspec gcsfs torchtune
+
+# Step 2: 手动安装缺失的依赖
+# ======================
+!pip install datasets==2.14.6 fsspec==2023.10.0
+
+!pip install --no-deps -q gradio diffusers transformers accelerate torch torchvision torchaudio gTTS safetensors moviepy opencv-python addict
+# Step 3: 运行完整 SEFS 代码
+
+# 导入库
+import gradio as gr
+from diffusers import StableDiffusionPipeline, AnimateDiffPipeline, DDIMScheduler
+from diffusers.models import UNet2DConditionModel
+from diffusers.utils import export_to_gif
+import torch
+from gtts import gTTS
+import os
+
+# ======================
+# GPU 验证
+# ======================
+print("CUDA available:", torch.cuda.is_available())
+if torch.cuda.is_available():
+    print("Using GPU:", torch.cuda.get_device_name(0))
+
+# ======================
+# 1. 文字生图 (Text2Image)
+# ======================
+pipe = StableDiffusionPipeline.from_pretrained(
+    "runwayml/stable-diffusion-v1-5",
+    torch_dtype=torch.float16,
+    use_safetensors=True
+).to("cuda")
+pipe.enable_attention_slicing()
+
+def text_to_image(prompt):
+    with torch.autocast("cuda"):
+        image = pipe(prompt).images[0]
+    return image
+
+# ======================
+# 2. 语音合成 (text2audio)
+# ======================
+def text_to_speech(text):
+    lang = "zh" if any('\u4e00' <= char <= '\u9fff' for char in text) else "en"
+    tts = gTTS(text=text, lang=lang, slow=False)
+    tts.save("output.mp3")
+    return "output.mp3"
+
+# ======================
+# ======================
+# 3. 生动图 (image2video)
+# ======================
+from diffusers import MotionAdapter, AnimateDiffPipeline, DDIMScheduler
+from diffusers.utils import export_to_gif
+import torch
+
+# 初始化一次（避免重复加载）
+_motion_pipe = None
+
+def get_animate_pipe():
+    global _motion_pipe
+    if _motion_pipe is None:
+        adapter = MotionAdapter.from_pretrained(
+            "guoyww/animatediff-motion-adapter-v1-5-2",
+            torch_dtype=torch.float16
+        )
+        pipe = AnimateDiffPipeline.from_pretrained(
+            "runwayml/stable-diffusion-v1-5",
+            motion_adapter=adapter,
+            torch_dtype=torch.float16
+        ).to("cuda")
+        pipe.scheduler = DDIMScheduler.from_config(
+            pipe.scheduler.config,
+            timestep_spacing="trailing",
+            beta_schedule="linear"
+        )
+        _motion_pipe = pipe
+    return _motion_pipe
+
+def image_to_video(image_path, prompt=""):
+    try:
+        pipe = get_animate_pipe()
+        result = pipe(
+            prompt=prompt if prompt else "A beautiful animated scene",
+            num_frames=16,
+            guidance_scale=7.5,
+            num_inference_steps=25
+        )
+        output_path = "output_animation.gif"
+        export_to_gif(result.frames[0], output_path)
+        return output_path
+    except Exception as e:
+        print(f"生成失败: {str(e)}")
+        return None
+
+# ======================
+# 4. 视频剪辑
+# ======================
+video_clips = []
+
+def add_clip(video_path):
+    global video_clips
+    if video_path and os.path.exists(video_path):
+        video_clips.append(video_path)
+    return f"时间线: {len(video_clips)} 个片段"
+
+def export_final_video():
+    global video_clips
+    if not video_clips:
+        return None
+    
+    try:
+        clips = [VideoFileClip(clip) for clip in video_clips]
+        final_clip = concatenate_videoclips(clips, method="compose")
+        output_path = "final_movie.mp4"
+        final_clip.write_videofile(output_path, fps=8, verbose=False, logger=None)
+        
+        for clip in clips:
+            clip.close()
+        final_clip.close()
+        return output_path
+    except Exception as e:
+        return None
+
+def reset_timeline():
+    global video_clips
+    video_clips = []
+    return "时间线已清空"
+
+# ======================
+# 创建界面
+# ======================
+with gr.Blocks(title="Super-Easy Filmmaking System") as demo:
+    gr.Markdown("# 🎬 Super-Easy Filmmaking System")
+    gr.Markdown("### 零成本AI电影制作系统 | 所有功能免费使用")
+    
+    with gr.Tab("1. 文字生图 Text2Image"):
+        txt = gr.Textbox(label="场景描述（英文效果更佳）", placeholder="e.g., A cyberpunk city at night, raining")
+        btn1 = gr.Button("生成图片（GPU加速）")
+        img_out = gr.Image()
+        btn1.click(text_to_image, inputs=txt, outputs=img_out)
+    
+    with gr.Tab("2. 语音合成 Text2Audio"):
+        txt2 = gr.Textbox(label="台词（自动识别中/英文）", placeholder="输入您的台词...")
+        btn2 = gr.Button("生成语音")
+        audio_out = gr.Audio()
+        btn2.click(text_to_speech, inputs=txt2, outputs=audio_out)
+    
+    with gr.Tab("3. 图片生动图 Image2Video"):
+        with gr.Row():
+            img_in = gr.Image(type="filepath", label="上传图片")
+            prompt_in = gr.Textbox(label="动画描述（可选）", placeholder="e.g., camera slowly zooms in")
+        btn3 = gr.Button("生成动画（约30秒）")
+        video_out = gr.Video()
+        btn3.click(image_to_video, inputs=[img_in, prompt_in], outputs=video_out)
+    
+    with gr.Tab("4. 视频剪辑 Video-Edit"):
+        gr.Markdown("### 🎞️ 将生成的视频片段拼接成完整电影")
+        with gr.Row():
+            clip_input = gr.Video(label="选择视频片段")
+            add_btn = gr.Button("添加到时间线")
+        status = gr.Textbox(label="状态")
+        with gr.Row():
+            export_btn = gr.Button("导出最终电影", variant="primary")
+            reset_btn = gr.Button("清空时间线")
+        final_video = gr.Video(label="您的电影作品")
+        
+        add_btn.click(add_clip, inputs=clip_input, outputs=status)
+        export_btn.click(export_final_video, outputs=final_video)
+        reset_btn.click(reset_timeline, outputs=status)
+
+# 启动
+demo.launch(share=True)
